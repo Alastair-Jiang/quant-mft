@@ -43,6 +43,13 @@ from datetime import datetime
 from typing import Tuple, Dict, List, Optional
 warnings.filterwarnings("ignore")
 
+# Telegram 通知（可选，未配置则跳过）
+try:
+    from src.pipeline.notifier import send_training_done, send_all_experiments_done, send_error
+    _TELEGRAM_AVAILABLE = True
+except ImportError:
+    _TELEGRAM_AVAILABLE = False
+
 # ============================================================
 # 全局配置
 # ============================================================
@@ -82,6 +89,10 @@ LGB_PARAMS = {
 
 # 实验记录
 EXPERIMENT_LOG = DATA_DIR / "experiments.csv"
+
+# 断点续训
+CHECKPOINT_DIR = MODEL_DIR / "checkpoints"    # 断点保存目录
+CHECKPOINT_EVERY_N_EPOCHS = 5                  # 每5个epoch存一次断点
 
 
 # ============================================================
@@ -385,13 +396,83 @@ class StockDataset(Dataset):
 
 
 # ============================================================
+# Part C-extra: 断点续训
+# ============================================================
+
+def save_checkpoint(checkpoint_name: str, epoch: int, model: nn.Module,
+                    optimizer: torch.optim.Optimizer, scheduler,
+                    scaler, best_val_loss: float, best_epoch: int,
+                    best_state: dict, patience_counter: int,
+                    history: dict):
+    """
+    保存训练断点到磁盘, 用于中断后从断点继续。
+
+    保存的内容比模型文件多：
+        - 优化器状态 → 恢复后 momentum/Adam 的二阶矩不会丢失
+        - scheduler 状态 → 学习率曲线继续而非从头衰减
+        - AMP scaler 状态 → 混合精度损失缩放比例继续
+        - early stopping 计数器 → 不会因为中断重置计数值
+
+    参数:
+        checkpoint_name: 断点文件名 (不含路径)
+        其余: 训练循环中的当前状态变量
+    """
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    path = CHECKPOINT_DIR / f"{checkpoint_name}.pt"
+
+    scaler_state = scaler.state_dict() if scaler is not None else None
+
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler_state,
+        "best_val_loss": best_val_loss,
+        "best_epoch": best_epoch,
+        "best_state": best_state,
+        "patience_counter": patience_counter,
+        "history": history,
+    }
+    torch.save(checkpoint, path)
+
+
+def load_checkpoint(checkpoint_name: str) -> dict | None:
+    """
+    尝试加载之前的断点。
+
+    返回:
+        checkpoint dict 或 None (没有断点)
+    """
+    path = CHECKPOINT_DIR / f"{checkpoint_name}.pt"
+    if not path.exists():
+        return None
+    print(f"📂 发现断点: {path.name} ({path.stat().st_size/1024:.0f}KB)")
+    return torch.load(path, map_location=DEVICE)
+
+
+# ============================================================
 # Part D: 训练循环
 # ============================================================
 
 def train_transformer(model, train_loader, val_loader, n_epochs=N_EPOCHS,
                       lr=LEARNING_RATE, device=DEVICE,
-                      use_amp: bool = USE_AMP) -> Dict:
-    """训练 Transformer, 返回最佳模型和训练历史"""
+                      use_amp: bool = USE_AMP,
+                      checkpoint_name: str = None,
+                      resume: bool = True) -> Dict:
+    """
+    训练 Transformer, 返回最佳模型和训练历史。
+
+    断点续训机制:
+        - 如果 resume=True 且 checkpoint 文件存在 → 恢复状态从断点继续
+        - 每 CHECKPOINT_EVERY_N_EPOCHS 自动存一次断点
+        - 训练完成(含 early stop)后自动删除断点文件
+        - Ctrl+C 中断时自动保存断点, 下次自动续训
+
+    参数:
+        checkpoint_name: 断点文件名 (不含路径和扩展名), None=不启用断点
+        resume: 是否尝试从断点恢复
+    """
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -400,6 +481,7 @@ def train_transformer(model, train_loader, val_loader, n_epochs=N_EPOCHS,
     criterion = nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
+    # ---- 初始状态 ----
     best_val_loss = float("inf")
     best_state = None
     best_epoch = 0
@@ -407,94 +489,145 @@ def train_transformer(model, train_loader, val_loader, n_epochs=N_EPOCHS,
     early_stop_patience = 50    # 50 epoch不降才停
     min_delta = 1e-5            # 低于此视为无改善
     history = {"train_loss": [], "val_loss": [], "val_acc": [], "val_auc": [], "epoch_time": []}
+    start_epoch = 0
+
+    # ---- 尝试从断点恢复 ----
+    if resume and checkpoint_name is not None:
+        checkpoint = load_checkpoint(checkpoint_name)
+        if checkpoint is not None:
+            model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            if checkpoint["scaler_state_dict"] is not None and scaler is not None:
+                scaler.load_state_dict(checkpoint["scaler_state_dict"])
+            best_val_loss = checkpoint["best_val_loss"]
+            best_epoch = checkpoint["best_epoch"]
+            best_state = checkpoint["best_state"]
+            patience_counter = checkpoint["patience_counter"]
+            history = checkpoint["history"]
+            start_epoch = checkpoint["epoch"] + 1  # 从下一个epoch开始
+            print(f"🔄 从断点恢复: epoch {start_epoch}/{n_epochs} | "
+                  f"最佳@epoch {best_epoch+1} (val_loss={best_val_loss:.4f}) | "
+                  f"耐心计数 {patience_counter}/{early_stop_patience}")
+            # checkpoint加载后立即删除, 避免重复使用
+            (CHECKPOINT_DIR / f"{checkpoint_name}.pt").unlink()
+            print(f"🗑 已清理断点文件, 训练完成后会重新保存")
 
     print(f"\n🚀 Transformer 训练 | {sum(p.numel() for p in model.parameters()):,} 参数 | {device}")
     print(f"   AMP混合精度: {use_amp} | Batch: {train_loader.batch_size} | Seq: {model.seq_len}")
     print(f"   EarlyStopping: patience={early_stop_patience} min_delta={min_delta}")
+    if checkpoint_name:
+        print(f"   断点: 每{CHECKPOINT_EVERY_N_EPOCHS}epoch自动保存")
     print(f"{'='*60}")
 
-    for epoch in range(n_epochs):
-        t0 = time.time()
+    try:
+        for epoch in range(start_epoch, n_epochs):
+            t0 = time.time()
 
-        # Train — 每个epoch一个batch级进度条
-        model.train()
-        train_loss = 0.0
-        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:3d}/{n_epochs} Train",
-                          unit="batch", leave=False,
-                          bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
-        for x, y_bin, _ in train_pbar:
-            x, y_bin = x.to(device, non_blocking=True), y_bin.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                logits = model(x)
-                loss = criterion(logits, y_bin)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            train_loss += loss.item() * x.size(0)
-            train_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-        train_loss /= len(train_loader.dataset)
-
-        # Val — batch级进度条
-        model.eval()
-        val_loss = 0.0
-        all_probs, all_labels_bin, all_labels_dir = [], [], []
-        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1:3d}/{n_epochs} Val  ",
-                        unit="batch", leave=False,
-                        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
-        with torch.no_grad():
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                for x, y_bin, y_dir in val_pbar:
-                    x, y_bin = x.to(device, non_blocking=True), y_bin.to(device, non_blocking=True)
+            # Train — 每个epoch一个batch级进度条
+            model.train()
+            train_loss = 0.0
+            train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:3d}/{n_epochs} Train",
+                              unit="batch", leave=False,
+                              bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
+            for x, y_bin, _ in train_pbar:
+                x, y_bin = x.to(device, non_blocking=True), y_bin.to(device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                with torch.amp.autocast("cuda", enabled=use_amp):
                     logits = model(x)
                     loss = criterion(logits, y_bin)
-                    val_loss += loss.item() * x.size(0)
-                    probs = F.softmax(logits, dim=-1)
-                    all_probs.append(probs.cpu().numpy())
-                    all_labels_bin.append(y_bin.cpu().numpy())
-                    all_labels_dir.append(y_dir.numpy())
-        val_loss /= len(val_loader.dataset)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                train_loss += loss.item() * x.size(0)
+                train_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            train_loss /= len(train_loader.dataset)
 
-        probs = np.vstack(all_probs)
-        labels_bin = np.concatenate(all_labels_bin)
-        labels_dir = np.concatenate(all_labels_dir)
+            # Val — batch级进度条
+            model.eval()
+            val_loss = 0.0
+            all_probs, all_labels_bin, all_labels_dir = [], [], []
+            val_pbar = tqdm(val_loader, desc=f"Epoch {epoch+1:3d}/{n_epochs} Val  ",
+                            unit="batch", leave=False,
+                            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    for x, y_bin, y_dir in val_pbar:
+                        x, y_bin = x.to(device, non_blocking=True), y_bin.to(device, non_blocking=True)
+                        logits = model(x)
+                        loss = criterion(logits, y_bin)
+                        val_loss += loss.item() * x.size(0)
+                        probs = F.softmax(logits, dim=-1)
+                        all_probs.append(probs.cpu().numpy())
+                        all_labels_bin.append(y_bin.cpu().numpy())
+                        all_labels_dir.append(y_dir.numpy())
+            val_loss /= len(val_loader.dataset)
 
-        # 方向准确率 (涨 vs 跌)
-        dir_prob = probs[:, 3:].sum(axis=1)  # 后3个bin=涨
-        val_acc = accuracy_score(labels_dir, dir_prob > 0.5)
-        val_auc = roc_auc_score(labels_dir, dir_prob)
+            probs = np.vstack(all_probs)
+            labels_bin = np.concatenate(all_labels_bin)
+            labels_dir = np.concatenate(all_labels_dir)
 
-        scheduler.step(val_loss)
-        epoch_time = time.time() - t0
+            # 方向准确率 (涨 vs 跌)
+            dir_prob = probs[:, 3:].sum(axis=1)  # 后3个bin=涨
+            val_acc = accuracy_score(labels_dir, dir_prob > 0.5)
+            val_auc = roc_auc_score(labels_dir, dir_prob)
 
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-        history["val_acc"].append(val_acc)
-        history["val_auc"].append(val_auc)
-        history["epoch_time"].append(epoch_time)
+            scheduler.step(val_loss)
+            epoch_time = time.time() - t0
 
-        if val_loss < best_val_loss - min_delta:
-            best_val_loss = val_loss
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            best_epoch = epoch
-            patience_counter = 0
-            improved = "*"
-        else:
-            patience_counter += 1
-            improved = " "
+            history["train_loss"].append(train_loss)
+            history["val_loss"].append(val_loss)
+            history["val_acc"].append(val_acc)
+            history["val_auc"].append(val_auc)
+            history["epoch_time"].append(epoch_time)
 
-        lr_now = optimizer.param_groups[0]['lr']
-        print(f"Epoch {epoch+1:3d}/{n_epochs} | train_loss {train_loss:.4f} | "
-              f"val_loss {val_loss:.4f} | acc {val_acc:.3f} | auc {val_auc:.4f} | "
-              f"lr {lr_now:.1e} | {epoch_time:.0f}s{improved}")
+            if val_loss < best_val_loss - min_delta:
+                best_val_loss = val_loss
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                best_epoch = epoch
+                patience_counter = 0
+                improved = "*"
+            else:
+                patience_counter += 1
+                improved = " "
 
-        # Early stopping: patience轮不改善则停止
-        if patience_counter >= early_stop_patience:
-            print(f"⏹ EarlyStopping at epoch {epoch+1}: val_loss未改善{early_stop_patience}轮 "
-                  f"(best@{best_epoch+1}: {best_val_loss:.4f})")
-            break
+            lr_now = optimizer.param_groups[0]['lr']
+            print(f"Epoch {epoch+1:3d}/{n_epochs} | train_loss {train_loss:.4f} | "
+                  f"val_loss {val_loss:.4f} | acc {val_acc:.3f} | auc {val_auc:.4f} | "
+                  f"lr {lr_now:.1e} | {epoch_time:.0f}s{improved}")
+
+            # ---- 定期保存断点 ----
+            if checkpoint_name is not None and (epoch + 1) % CHECKPOINT_EVERY_N_EPOCHS == 0:
+                save_checkpoint(checkpoint_name, epoch, model, optimizer, scheduler,
+                                scaler, best_val_loss, best_epoch, best_state,
+                                patience_counter, history)
+                print(f"   💾 断点已保存 (epoch {epoch+1})")
+
+            # Early stopping: patience轮不改善则停止
+            if patience_counter >= early_stop_patience:
+                print(f"⏹ EarlyStopping at epoch {epoch+1}: val_loss未改善{early_stop_patience}轮 "
+                      f"(best@{best_epoch+1}: {best_val_loss:.4f})")
+                break
+
+    except KeyboardInterrupt:
+        # Ctrl+C 优雅中断 → 保存断点
+        if checkpoint_name is not None:
+            save_checkpoint(checkpoint_name, epoch, model, optimizer, scheduler,
+                            scaler, best_val_loss, best_epoch, best_state,
+                            patience_counter, history)
+            print(f"\n⏸ Ctrl+C 中断! 断点已保存到 {CHECKPOINT_DIR / checkpoint_name}.pt")
+            print(f"   📍 当前进度: epoch {epoch+1}/{n_epochs} | 最佳@epoch {best_epoch+1}")
+            print(f"   💡 下次运行会自动从断点继续")
+        raise
+
+    # 训练完成 → 清理断点
+    if checkpoint_name is not None:
+        checkpoint_path = CHECKPOINT_DIR / f"{checkpoint_name}.pt"
+        if checkpoint_path.exists():
+            checkpoint_path.unlink()
+            print(f"🗑 训练完成, 断点文件已清理")
 
     # 恢复最佳模型
     model.load_state_dict(best_state)
@@ -582,7 +715,8 @@ def run_experiment(name: str, d_model: int, n_layers: int, n_heads: int,
     print(f"   参数量: {n_params:,}")
 
     tf_history = train_transformer(model, train_loader, val_loader,
-                                   n_epochs=n_epochs, lr=lr, device=DEVICE)
+                                   n_epochs=n_epochs, lr=lr, device=DEVICE,
+                                   checkpoint_name=f"transformer_{name}")
 
     # LightGBM baseline
     lgb_model, lgb_metrics = train_lightgbm_baseline(feature_df, returns_df, train_days, val_days)
@@ -616,6 +750,21 @@ def run_experiment(name: str, d_model: int, n_layers: int, n_heads: int,
     # 追加实验记录
     _log_experiment(result)
 
+    # Telegram 通知
+    if _TELEGRAM_AVAILABLE:
+        try:
+            elapsed = f"{result['total_epoch_time']/3600:.1f}h" if result['total_epoch_time'] > 3600 else f"{result['total_epoch_time']:.0f}s"
+            send_training_done(
+                experiment_name=name,
+                auc=result["tf_best_val_auc"],
+                acc=result["tf_best_val_acc"],
+                epoch=n_epochs,
+                elapsed=elapsed,
+                gpu_info=f"{torch.cuda.get_device_name(0)}" if torch.cuda.is_available() else "CPU",
+            )
+        except Exception:
+            pass  # 通知失败不影响训练
+
     return result
 
 
@@ -635,7 +784,10 @@ def _log_experiment(result: Dict):
 def main():
     print(f"\n{'='*70}")
     print(f"🚀 6小时 GPU 训练启动")
-    print(f"   GPU: {torch.cuda.get_device_name(0)} ({torch.cuda.get_device_properties(0).total_memory/1024**3:.0f}GB)")
+    if torch.cuda.is_available():
+        print(f"   GPU: {torch.cuda.get_device_name(0)} ({torch.cuda.get_device_properties(0).total_memory/1024**3:.0f}GB)")
+    else:
+        print(f"   ⚠️ 未检测到 GPU, 使用 CPU 训练")
     print(f"   开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*70}")
 
@@ -655,75 +807,125 @@ def main():
     train_days = range(SEQ_LEN, n_train_days)
     val_days = range(n_train_days, N_DAYS - 1)
 
-    # ---- 3. 运行多组实验 (网格搜索, 压满GPU) ----
+    # ---- 3. 定义实验列表 ----
+    experiment_configs = [
+        # (name, d_model, n_layers, n_heads, lr, batch_size, n_epochs)
+        ("stockgpt_baseline", 128, 4, 4, 1e-4, 1536, 500),
+        ("deep_l8",           128, 8, 8, 5e-5, 768,  500),
+        ("wide_d384",         384, 4, 8, 1e-4, 768,  500),
+        ("xl_d384_l12",       384, 12, 12, 3e-5, 384, 500),
+        ("fast_bigbatch",     128, 4, 4, 5e-4, 2048, 500),
+    ]
+
+    # ---- 4. 运行实验 (跳过已完成的) ----
     experiments = []
+    for config in experiment_configs:
+        name = config[0]
+        tf_model_path = MODEL_DIR / f"transformer_{name}.pt"
+        lgb_model_path = MODEL_DIR / f"lightgbm_{name}.txt"
 
-    # 实验1: StockGPT Baseline
-    results = run_experiment("stockgpt_baseline", d_model=128, n_layers=4, n_heads=4,
-                             lr=1e-4, batch_size=1536, n_epochs=500,
-                             dataset=dataset,
-                             feature_df=features_df, returns_df=returns_df,
-                             train_days=train_days, val_days=val_days)
-    experiments.append(results)
+        # 检查是否已完成
+        if tf_model_path.exists() and lgb_model_path.exists():
+            print(f"\n⏭ {name}: 模型已存在, 跳过")
+            # 从已有记录中恢复实验数据
+            if EXPERIMENT_LOG.exists():
+                df_old = pd.read_csv(EXPERIMENT_LOG)
+                matched = df_old[df_old["experiment"] == name]
+                if len(matched) > 0:
+                    experiments.append(matched.iloc[-1].to_dict())
+            continue
 
-    # 实验2: Deep L8
-    results = run_experiment("deep_l8", d_model=128, n_layers=8, n_heads=8,
-                             lr=5e-5, batch_size=768, n_epochs=500,
-                             dataset=dataset,
-                             feature_df=features_df, returns_df=returns_df,
-                             train_days=train_days, val_days=val_days)
-    experiments.append(results)
+        # 检查是否有未完成的断点
+        ckpt_path = CHECKPOINT_DIR / f"transformer_{name}.pt"
+        if ckpt_path.exists():
+            print(f"   📂 发现未完成断点, 将从断点继续")
 
-    # 实验3: Wide d=384
-    results = run_experiment("wide_d384", d_model=384, n_layers=4, n_heads=8,
-                             lr=1e-4, batch_size=768, n_epochs=500,
-                             dataset=dataset,
-                             feature_df=features_df, returns_df=returns_df,
-                             train_days=train_days, val_days=val_days)
-    experiments.append(results)
+        try:
+            results = run_experiment(
+                name, config[1], config[2], config[3],  # d_model, n_layers, n_heads
+                config[4], config[5], config[6],         # lr, batch_size, n_epochs
+                dataset=dataset,
+                feature_df=features_df, returns_df=returns_df,
+                train_days=train_days, val_days=val_days
+            )
+            experiments.append(results)
+        except KeyboardInterrupt:
+            print(f"\n⏸ 用户中断, 当前实验断点已保存")
+            print(f"   已完成实验: {len(experiments)}/{len(experiment_configs)}")
+            print(f"   💡 下次运行会自动从断点继续")
+            break
 
-    # 实验4: XL 压满16GB
-    results = run_experiment("xl_d384_l12", d_model=384, n_layers=12, n_heads=12,
-                             lr=3e-5, batch_size=384, n_epochs=500,
-                             dataset=dataset,
-                             feature_df=features_df, returns_df=returns_df,
-                             train_days=train_days, val_days=val_days)
-    experiments.append(results)
-
-    # 实验5: 大batch快收敛
-    results = run_experiment("fast_bigbatch", d_model=128, n_layers=4, n_heads=4,
-                             lr=5e-4, batch_size=2048, n_epochs=500,
-                             dataset=dataset,
-                             feature_df=features_df, returns_df=returns_df,
-                             train_days=train_days, val_days=val_days)
-    experiments.append(results)
-
-    # ---- 4. 总结报告 ----
+    # ---- 5. 总结报告 ----
     total_time = time.time() - t_start
     hours = total_time / 3600
 
+    # 合并本次新跑的 + 从实验记录加载的已有结果
+    if EXPERIMENT_LOG.exists():
+        df_log = pd.read_csv(EXPERIMENT_LOG)
+        # 用新跑的结果覆盖同名旧记录
+        if experiments:
+            df_new = pd.DataFrame(experiments)
+            new_names = set(df_new["experiment"].tolist())
+            df_log = df_log[~df_log["experiment"].isin(new_names)]
+            df_log = pd.concat([df_log, df_new], ignore_index=True)
+        experiments_all = df_log.to_dict("records")
+    else:
+        experiments_all = experiments
+
+    n_total = len(experiment_configs)
+    n_done = len(experiments_all)
+
     print(f"\n{'='*70}")
-    print(f"🏁 训练完成!")
+    if n_done >= n_total:
+        print(f"🏁 全部实验完成!")
+    else:
+        print(f"⏸ 训练中断/部分完成")
     print(f"   总耗时: {hours:.1f} 小时")
-    print(f"   完成实验: {len(experiments)} 组")
+    print(f"   完成实验: {n_done}/{n_total}")
     print(f"   实验记录: {EXPERIMENT_LOG}")
     print(f"   模型保存: {MODEL_DIR}")
+    if CHECKPOINT_DIR.exists():
+        remaining = list(CHECKPOINT_DIR.glob("*.pt"))
+        if remaining:
+            print(f"   未完成断点: {len(remaining)} 个")
+            for ckpt in remaining:
+                print(f"      ⏳ {ckpt.stem}")
     print(f"{'='*70}")
 
     # 打印排名
-    if experiments:
-        df = pd.DataFrame(experiments)
-        print("\n📊 实验结果排名 (按 Transformer val_auc):")
-        df_sorted = df.sort_values("tf_best_val_auc", ascending=False)
-        for i, (_, row) in enumerate(df_sorted.iterrows()):
-            print(f"   {i+1}. {row['experiment']:20s} | TF_AUC {row['tf_best_val_auc']:.4f} "
-                  f"| LGB_AUC {row['lgb_val_auc']:.4f} | Params {row['n_params']:,}")
+    if experiments_all:
+        df = pd.DataFrame(experiments_all)
+        if "tf_best_val_auc" in df.columns:
+            print("\n📊 实验结果排名 (按 Transformer val_auc):")
+            df_sorted = df.sort_values("tf_best_val_auc", ascending=False)
+            for i, (_, row) in enumerate(df_sorted.iterrows()):
+                print(f"   {i+1}. {row['experiment']:20s} | TF_AUC {row['tf_best_val_auc']:.4f} "
+                      f"| LGB_AUC {row['lgb_val_auc']:.4f} | Params {row['n_params']:,}")
 
-        print(f"\n📊 实验结果排名 (按 LightGBM val_auc):")
-        df_sorted = df.sort_values("lgb_val_auc", ascending=False)
-        for i, (_, row) in enumerate(df_sorted.iterrows()):
-            print(f"   {i+1}. {row['experiment']:20s} | LGB_AUC {row['lgb_val_auc']:.4f} "
-                  f"| TF_AUC {row['tf_best_val_auc']:.4f} | {row['lgb_train_time']:.0f}s")
+        if "lgb_val_auc" in df.columns:
+            print(f"\n📊 实验结果排名 (按 LightGBM val_auc):")
+            df_sorted = df.sort_values("lgb_val_auc", ascending=False)
+            for i, (_, row) in enumerate(df_sorted.iterrows()):
+                print(f"   {i+1}. {row['experiment']:20s} | LGB_AUC {row['lgb_val_auc']:.4f} "
+                      f"| TF_AUC {row['tf_best_val_auc']:.4f} | {row['lgb_train_time']:.0f}s")
+
+    # Telegram 汇总通知
+    if _TELEGRAM_AVAILABLE and experiments_all:
+        try:
+            df = pd.DataFrame(experiments_all)
+            if "tf_best_val_auc" in df.columns:
+                best_row = df.loc[df["tf_best_val_auc"].idxmax()]
+                top = f"{best_row['experiment']} (AUC={best_row['tf_best_val_auc']:.4f})"
+            else:
+                top = ""
+            send_all_experiments_done(
+                n_done=n_done,
+                n_total=n_total,
+                elapsed=f"{hours:.1f}h",
+                top_result=top,
+            )
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
