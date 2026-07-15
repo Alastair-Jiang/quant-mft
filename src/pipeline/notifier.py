@@ -31,6 +31,12 @@ Telegram 通知模块 — 训练完成/信号推送/异常告警
 日期: 2026-07-15
 """
 
+import sys
+import io
+# 修复 Windows GBK 终端编码问题
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 import yaml
 import asyncio
 from pathlib import Path
