@@ -1,0 +1,164 @@
+# ============================================================
+# quant-mft 默认配置文件
+# ============================================================
+# 作用：所有可调参数集中管理，避免散落在代码各处
+#
+# 使用方式：
+#   1. 复制此文件为 config/local.yaml（已在 .gitignore 中忽略）
+#   2. 在 local.yaml 中覆盖你要改的参数
+#   3. 代码中读取时，local.yaml 的值覆盖 default.yaml
+#
+# ⚠️ 量化项目大忌：参数散落在各个 .py 文件里
+#    → 回测结果不可复现 → 面试/展示时说不清用了什么参数
+# ============================================================
+
+# ---- 数据获取 ----
+data:
+  # A股日线数据
+  stock:
+    start_date: "20230101"       # 拉取数据的起始日期 (YYYYMMDD)
+    end_date: null               # 结束日期，null = 当天
+    adjust: "qfq"                # 复权方式: "qfq"=前复权, "hfq"=后复权, ""=不复权
+    request_delay: 2             # 每次API请求间隔（秒），太快会被东方财富封IP
+    history_years: 3             # 拉取多少年的历史数据
+
+  # 数据存储路径（相对于项目根目录）
+  paths:
+    raw_data: "data/a_stock_daily.csv"
+    clean_data: "data/a_stock_daily_clean.parquet"
+    features: "data/features.parquet"
+    signals: "data/signals.csv"
+    trades: "data/backtest_trades.csv"
+    experiments: "data/experiments.csv"
+
+# ---- 数据清洗 ----
+cleaning:
+  # 极值处理 (Winsorization)
+  winsorize:
+    method: "mad"                # 方法: "mad"=MAD, "sigma"=标准差, "percentile"=百分位
+    threshold: 5                 # MAD倍数阈值（method=mad时使用）
+
+  # 缺失值处理
+  missing:
+    stock_suspend_max_days: 60   # 连续停牌超过此天数 → 剔除该股票
+    min_trading_days: 200        # 股票历史交易日不足此数 → 剔除（新股数据太少）
+
+  # ST股票处理
+  st_filter:
+    exclude_st: true             # 是否排除ST股票（建议true，ST涨跌停规则不同）
+
+# ---- 特征工程 ----
+features:
+  # 均线参数
+  ma_windows: [5, 10, 20, 60]   # 均线计算窗口
+
+  # RSI参数
+  rsi_window: 14                 # RSI计算周期
+
+  # MACD参数
+  macd:
+    fast: 12                     # 快线EMA周期
+    slow: 26                     # 慢线EMA周期
+    signal: 9                    # 信号线EMA周期
+
+  # 波动率参数
+  volatility_window: 20          # 历史波动率计算窗口
+
+  # ATR参数
+  atr_window: 14                 # ATR计算周期
+
+  # 布林带参数
+  bollinger:
+    window: 20                   # 布林带中轨窗口
+    num_std: 2                   # 上下轨标准差倍数
+
+  # 成交量参数
+  volume_ratio_windows: [5, 20]  # 量比计算窗口
+
+  # 因子筛选阈值
+  selection:
+    min_abs_ic: 0.02             # 最小IC绝对值（低于此值考虑剔除）
+    max_correlation: 0.8         # 因子间最大相关系数（超过则二选一）
+    max_missing_rate: 0.3        # 因子最大缺失率（超过则剔除）
+
+# ---- 模型训练 ----
+model:
+  # 时间序列切分（禁止随机切！）
+  train_ratio: 0.7               # 训练集占比（前70%时间）
+  val_ratio: 0.15                # 验证集占比（中间15%时间）
+  test_ratio: 0.15               # 测试集占比（最后15%时间）
+
+  # LightGBM 超参
+  lightgbm:
+    objective: "binary"          # 二分类：预测次日涨(1)/跌(0)
+    metric: "auc"                # 评估指标
+    num_leaves: 31               # 每棵树的叶子数（控制复杂度）
+    max_depth: -1                # 树深度限制，-1=不限制
+    learning_rate: 0.01          # 学习率
+    n_estimators: 1000           # 最大迭代次数（配合early_stopping）
+    min_child_samples: 100       # 叶子节点最少样本数（防止过拟合）
+    subsample: 0.8               # 每棵树采样比例（行采样）
+    colsample_bytree: 0.8        # 每棵树特征采样比例（列采样）
+    reg_alpha: 0.1               # L1正则化系数
+    reg_lambda: 0.1              # L2正则化系数
+    early_stopping_rounds: 50    # 验证集loss不降多少轮后停止
+    random_state: 42             # 随机种子（保证可复现）
+
+# ---- 回测 ----
+backtest:
+  # 初始资金
+  initial_capital: 100000        # 初始资金（元）
+
+  # 交易成本（A股标准）
+  cost:
+    commission_rate: 0.0003      # 佣金费率（万三，双边收取）
+    stamp_tax_rate: 0.001        # 印花税（千一，仅卖出收取）
+    slippage: 0.001              # 滑点（0.1%）
+
+  # 风控参数
+  risk:
+    max_position_pct: 0.2        # 单票最大仓位（20%，即最多持有5只）
+    max_positions: 5             # 最大同时持仓数
+    stop_loss_pct: 0.05          # 固定止损比例（-5%）
+    trailing_stop_pct: 0.03      # 移动止损回撤比例（从最高点回落3%则卖出）
+    max_daily_loss_pct: 0.05     # 单日最大亏损（超过则触发熔断）
+
+  # 过拟合检测阈值
+  overfitting:
+    sharpe_suspicious: 3.0       # 夏普超过此值 → 可疑
+    sharpe_definite: 4.0         # 夏普超过此值 → 几乎确定过拟合
+    annual_return_max: 0.5       # 年化收益超过此值且回撤<5% → 不可能三角
+    monte_carlo_perturbation: 0.2  # 蒙特卡洛参数扰动幅度（±20%）
+    monte_carlo_threshold: 0.5   # 扰动后夏普下降超过50% → 判定过拟合
+    monte_carlo_n: 1000          # 蒙特卡洛模拟次数
+
+  # 基准对比
+  benchmark:
+    index_code: "000300"         # 基准指数代码（沪深300）
+    strategy: "buy_and_hold"     # 基准策略（买入持有）
+
+# ---- 自动管线 ----
+pipeline:
+  # 定时执行
+  schedule:
+    time: "15:30"                # 每天执行时间（收盘后半小时）
+    timezone: "Asia/Shanghai"    # 时区
+
+  # 交易日历
+  calendar:
+    source: "akshare"            # 交易日历来源（akshare有trade_date接口）
+    # 如果akshare获取失败，使用预置的交易日历文件
+    fallback_file: "config/trade_calendar.csv"
+
+  # 信号推送阈值
+  signal:
+    min_prob: 0.55               # 预测概率超过此值才生成信号
+    max_signals_per_day: 10      # 每日最多推送多少只股票
+
+# ---- 日志 ----
+logging:
+  level: "INFO"                  # 日志级别: DEBUG/INFO/WARNING/ERROR
+  format: "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+  file: "logs/quant.log"         # 日志文件路径
+  max_size_mb: 10                # 单个日志文件最大大小
+  backup_count: 5                # 保留的历史日志文件数
