@@ -14,10 +14,14 @@ Telegram 双向聊天 Bot — 接收指令, 查询状态, 触发操作
     检测到新消息后判断是不是命令（以 / 开头），是就调用对应的处理函数。
 
 支持的命令：
-    /ping      — 检查 bot 是否在线
-    /status    — 查看系统状态 (GPU、实验数、模型数)
-    /help      — 显示所有可用命令
-    随便说话   — 友好提示
+    /ping        — 检查 bot 是否在线
+    /status      — 查看系统状态 (GPU、实验、模型、断点)
+    /experiments — 实验排名 (Top 5, 按 AUC 排序)
+    /models      — 已保存的模型文件列表
+    /checkpoint  — 未完成的训练断点
+    /signals     — 最新交易信号
+    /help        — 显示所有可用命令
+    随便说话      — 关键词智能引导
 
 运行方式:
     python src/pipeline/chatbot.py
@@ -44,11 +48,41 @@ from datetime import datetime
 import pandas as pd
 import torch
 
+# 确保项目根目录在 Python 搜索路径中
+# (直接运行 chatbot.py 时, src/ 不在 sys.path)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.request import HTTPXRequest
 
 # 复用 notifier.py 的配置加载函数
 from src.pipeline.notifier import _load_telegram_config
+
+
+# ============================================================
+# 构建 Application (带自定义 HTTP 设置)
+# ============================================================
+
+def build_application(token: str) -> Application:
+    """
+    构建 Telegram Application，配置超时和连接池。
+
+    单独写成函数而非在 main() 里直接写，是为了方便后期加代理等配置。
+    """
+    # connect_timeout: 建立连接的超时 (秒), 默认5秒在墙内偶尔不够
+    # read_timeout:   等待响应的超时 (秒)
+    # write_timeout:  发送数据的超时 (秒)
+    # pool_timeout:   从连接池获取连接的超时
+    request = HTTPXRequest(
+        connect_timeout=15.0,   # 从5秒提高到15秒
+        read_timeout=30.0,      # 从默认5秒提高到30秒
+        write_timeout=15.0,
+        pool_timeout=5.0,
+    )
+    return Application.builder().token(token).request(request).build()
 
 # ============================================================
 # 配置
@@ -58,6 +92,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 MODEL_DIR = PROJECT_ROOT / "models"
 DATA_DIR = PROJECT_ROOT / "data"
 EXPERIMENT_LOG = DATA_DIR / "experiments.csv"
+SIGNALS_FILE = DATA_DIR / "signals.csv"
 
 
 # ============================================================
@@ -84,7 +119,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>📋 可用命令</b>\n"
         "\n"
         "/ping — 检查 bot 是否在线\n"
-        "/status — 查看系统状态 (GPU / 实验数 / 模型数)\n"
+        "/status — 系统状态 (GPU / 实验 / 模型 / 断点)\n"
+        "/experiments — 实验排名 (Top 5)\n"
+        "/models — 已保存的模型列表\n"
+        "/checkpoint — 未完成的训练断点\n"
+        "/signals — 最新交易信号\n"
         "/help — 显示此帮助信息"
     )
     await update.message.reply_text(text, parse_mode="HTML")
@@ -148,6 +187,161 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+def _fmt_size(size_bytes: int) -> str:
+    """把字节数转成人类可读的文件大小"""
+    if size_bytes < 1024:
+        return f"{size_bytes}B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.0f}KB"
+    else:
+        return f"{size_bytes / (1024 * 1024):.1f}MB"
+
+
+async def cmd_experiments(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /experiments — 实验排名 (Top 5, 按 Transformer AUC 排序)
+
+    数据来源: data/experiments.csv
+    """
+    if not EXPERIMENT_LOG.exists():
+        await update.message.reply_text("📊 暂无实验记录\n   先跑一次训练，结果会自动记录到 experiments.csv")
+        return
+
+    df = pd.read_csv(EXPERIMENT_LOG)
+    if len(df) == 0:
+        await update.message.reply_text("📊 实验记录为空")
+        return
+
+    lines = [f"<b>📊 实验排名</b> (共 {len(df)} 组)\n"]
+
+    if "tf_best_val_auc" in df.columns:
+        df_sorted = df.sort_values("tf_best_val_auc", ascending=False)
+        for i, (_, row) in enumerate(df_sorted.head(5).iterrows()):
+            medal = ["🥇", "🥈", "🥉", "4.", "5."][i]
+            lines.append(
+                f"{medal} <code>{row['experiment']}</code>\n"
+                f"   TF_AUC <b>{row['tf_best_val_auc']:.4f}</b> | "
+                f"LGB_AUC {row['lgb_val_auc']:.4f} | "
+                f"参数 {row['n_params']:,}"
+            )
+    else:
+        lines.append("⚠️ 实验记录格式不符 (缺少 tf_best_val_auc 列)")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /models — 已保存的模型文件列表
+    """
+    if not MODEL_DIR.exists():
+        await update.message.reply_text("💾 models/ 目录不存在")
+        return
+
+    tf_models = sorted(MODEL_DIR.glob("transformer_*.pt"))
+    lgb_models = sorted(MODEL_DIR.glob("lightgbm_*.txt"))
+
+    if not tf_models and not lgb_models:
+        await update.message.reply_text("💾 还没有保存的模型\n   跑一次训练就会自动保存")
+        return
+
+    lines = ["<b>💾 已保存模型</b>\n"]
+
+    if tf_models:
+        lines.append(f"<b>Transformer ({len(tf_models)} 个):</b>")
+        for m in tf_models:
+            lines.append(f"  - {m.name} ({_fmt_size(m.stat().st_size)})")
+
+    if lgb_models:
+        lines.append(f"\n<b>LightGBM ({len(lgb_models)} 个):</b>")
+        for m in lgb_models:
+            lines.append(f"  - {m.name} ({_fmt_size(m.stat().st_size)})")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_checkpoint(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /checkpoint — 查看未完成的训练断点
+    """
+    ckpt_dir = MODEL_DIR / "checkpoints"
+
+    if not ckpt_dir.exists():
+        await update.message.reply_text("✅ 无未完成断点\n   断节目录尚未创建")
+        return
+
+    ckpts = list(ckpt_dir.glob("*.pt"))
+    if not ckpts:
+        await update.message.reply_text("✅ 无未完成断点\n   所有训练都已正常完成")
+        return
+
+    lines = [f"<b>⏳ 未完成断点</b> ({len(ckpts)} 个)\n"]
+
+    for ckpt in ckpts:
+        try:
+            data = torch.load(ckpt, map_location="cpu", weights_only=True)
+            epoch = data.get("epoch", "?")
+            best_epoch = data.get("best_epoch", "?")
+            best_loss = data.get("best_val_loss", float("nan"))
+            name = ckpt.stem
+            lines.append(
+                f"  <code>{name}</code>\n"
+                f"   epoch {epoch} | 最佳@epoch {best_epoch} (loss={best_loss:.4f})"
+            )
+        except Exception:
+            lines.append(f"  <code>{ckpt.stem}</code> (无法读取详情)")
+
+    lines.append(f"\n💡 下次运行训练时会自动从断点继续")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /signals — 最新交易信号
+
+    数据来源: data/signals.csv (由 strategy/signal_generator.py 生成)
+    """
+    if not SIGNALS_FILE.exists():
+        await update.message.reply_text(
+            "📈 暂无交易信号\n\n"
+            "<i>signals.csv 不存在</i> — 需要先跑策略生成信号:\n"
+            "<code>python src/strategy/signal_generator.py</code>"
+        )
+        return
+
+    df = pd.read_csv(SIGNALS_FILE)
+    if len(df) == 0:
+        await update.message.reply_text("📈 信号文件为空，暂无信号")
+        return
+
+    # 取最近日期的最新一批信号（最多显示 5 个）
+    if "date" in df.columns:
+        latest_date = df["date"].max()
+        latest = df[df["date"] == latest_date].head(5)
+        date_str = str(latest_date)
+    else:
+        latest = df.head(5)
+        date_str = "最近"
+
+    lines = [f"<b>📈 最新信号</b> ({date_str})\n"]
+
+    for _, row in latest.iterrows():
+        code = row.get("code", "?")
+        name = row.get("name", "")
+        prob = row.get("prob", 0)
+        direction = row.get("direction", "?")
+        emoji = "📈" if "涨" in str(direction) else "📉"
+        lines.append(
+            f"{emoji} <code>{code}</code> {name}\n"
+            f"   方向: {direction} | 概率: <b>{prob:.1%}</b>"
+        )
+        if "expected_return" in row:
+            lines[-1] += f" | 预期收益: <b>{row['expected_return']:+.2%}</b>"
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     处理非命令消息 (普通文字)
@@ -160,6 +354,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 关键词智能引导
     if any(kw in text for kw in ["状态", "status", "怎么样", "进度"]):
         await cmd_status(update, context)
+    elif any(kw in text for kw in ["实验", "experiment", "排名", "auc"]):
+        await cmd_experiments(update, context)
+    elif any(kw in text for kw in ["模型", "model", "保存"]):
+        await cmd_models(update, context)
+    elif any(kw in text for kw in ["断点", "checkpoint", "续训"]):
+        await cmd_checkpoint(update, context)
+    elif any(kw in text for kw in ["信号", "signal", "买卖"]):
+        await cmd_signals(update, context)
     elif any(kw in text for kw in ["训练", "跑", "train", "开始"]):
         await update.message.reply_text(
             "💡 目前还不支持通过聊天触发训练，请去电脑上运行。\n"
@@ -172,6 +374,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👋 你好! 试试这些命令:\n\n"
             "/ping — 检查在线状态\n"
             "/status — 查看系统状态\n"
+            "/experiments — 实验排名\n"
+            "/models — 模型列表\n"
             "/help — 显示帮助"
         )
 
@@ -196,7 +400,7 @@ def main():
     # 创建 Application
     # Application 是 python-telegram-bot v20+ 的核心类,
     # 负责管理网络连接、轮询消息、分发到 handler
-    app = Application.builder().token(token).build()
+    app = build_application(token)
 
     # 注册命令处理器
     # CommandHandler: 匹配 /xxx 格式的消息
@@ -205,10 +409,14 @@ def main():
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("experiments", cmd_experiments))
+    app.add_handler(CommandHandler("models", cmd_models))
+    app.add_handler(CommandHandler("checkpoint", cmd_checkpoint))
+    app.add_handler(CommandHandler("signals", cmd_signals))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("✅ Bot 已上线! 在 Telegram 里给你的 bot 发消息试试")
-    print("   命令: /ping /status /help")
+    print("   命令: /ping /status /experiments /models /checkpoint /signals /help")
     print("   Ctrl+C 停止\n")
 
     # 开始轮询 (阻塞)
